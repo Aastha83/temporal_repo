@@ -21,14 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 
-
-# def cancel_workflow(handle,workflow_id):
-#     asyncio.run(handle.cancel())
-#     # print(f"Cancellation requested for workflow with ID: {workflow_id}")
-       
-
-
-
 def manage_workflow(handle, workflow_id):
     while True:
         action = input("Enter 'pause', 'resume', 'terminate', 'cancel' or 'q' to quit: ").lower()
@@ -45,8 +37,6 @@ def manage_workflow(handle, workflow_id):
 
         elif action == 'terminate':
             asyncio.run(handle.terminate(reason="User requested termination"))
-
-            # print(f"Termination requested for workflow {workflow_id}")
             break
 
         elif action == 'q':
@@ -64,6 +54,9 @@ async def skip_task(source_folder: str):
 @activity.defn
 async def list_files_activity(source_folder: str, backup_folder: str) -> List[Tuple[str, str]]:
     files_to_update = []
+
+    # if source_folder=="/Users/aasthathorat/temporal-project/source1":
+    #     raise Exception
 
     if not os.path.exists(source_folder):
         logger.error(f"Source folder '{source_folder}' does not exist.")
@@ -134,14 +127,25 @@ class FileBackupWorkflow:
         self.paused = False
         self.files_copied = {}
         self.folder_statuses = {}
+        self.initial_signal_received = False
+        self.direct_copy_folders = []
     
     @workflow.query
     def is_paused(self) -> bool:
         return self.paused
+    
+    @workflow.signal
+    def initial_signal(self, data):
+        print("signal received ")
+        self.initial_signal_received = True
+        self.direct_copy_folders = list(data.get('direct_copy_folders', []))
 
     @workflow.run
     async def run(self, source_folders: List[str], backup_folder: str, workflow_id: str):
-        # print("Starting file backup workflow.")
+
+        # Wait for the initial signal if it hasn't been received
+        await workflow.wait_condition(lambda: self.initial_signal_received)
+        
         
         # Run list_files_activity for all folders in parallel
         list_tasks = [
@@ -153,23 +157,27 @@ class FileBackupWorkflow:
             )
             for folder in source_folders
         ]
-        files_to_update_list = await asyncio.gather(*list_tasks)
-        
-        # Run process_folder for all folders in parallel
+        files_to_update_list = await asyncio.gather(*list_tasks, return_exceptions=True)
+
+            # Process each folder in parallel
         process_tasks = [
             self.process_folder(folder, files_to_update, backup_folder, workflow_id)
             for folder, files_to_update in zip(source_folders, files_to_update_list)
+            if not isinstance(files_to_update, Exception)
         ]
         await asyncio.gather(*process_tasks)
+        print("after gathering all from list files task no exceptionsss")
         
-        for folder, status in self.folder_statuses.items():
-            if status['success']:
-                print(f"Successfully processed folder: {folder}")
-            else:
-                print(f"Failed to process folder: {folder}. Reason: {status['error']}")
+         # Handle folders that failed during list_files_activity
+        for folder, files_to_update in zip(source_folders, files_to_update_list):
+            if isinstance(files_to_update, Exception):
+                self.folder_statuses[folder] = {'success': False, 'error': f"List files task failed: {str(files_to_update)}"}
+       
 
     async def process_folder(self, source_folder: str, files_to_update: List[str], backup_folder: str, workflow_id: str):
         try:
+           
+
             self.files_copied[source_folder] = 0
             if len(files_to_update) > 0:
                 copy_result = await workflow.execute_activity(
@@ -202,6 +210,15 @@ class FileBackupWorkflow:
                     _, additional_files_copied = remaining_result
                     self.files_copied[source_folder] += additional_files_copied
 
+            if len(files_to_update)==0:
+                # If there are no files to update, call the skip_task activity
+                await workflow.execute_activity(
+                    skip_task,
+                    args=[source_folder],
+                    start_to_close_timeout=timedelta(seconds=1),
+                )
+            
+
             print(f"\nFinished processing all {self.files_copied[source_folder]} files from {source_folder}")
             self.folder_statuses[source_folder] = {'success': True, 'error': None}
         
@@ -227,13 +244,18 @@ async def main():
     
     source_folders = [
         "/Users/aasthathorat/temporal-project/source1",
-        # "/Users/aasthathorat/temporal-project/source4",
-        #  "/Users/aasthathorat/temporal-project/source2"
-         "/Users/aasthathorat/temporal-project/source3",
-         "/Users/aasthathorat/temporal-project/source6"
+        "/Users/aasthathorat/temporal-project/source4",
+         "/Users/aasthathorat/temporal-project/source2",
+        #  "/Users/aasthathorat/temporal-project/source3",
+        #  "/Users/aasthathorat/temporal-project/source6"
 
     ]
     backup_folder = "/Users/aasthathorat/temporal-project/backup2"
+
+     # Prepare the initial signal data
+    initial_signal_data = {
+        'direct_copy_folders': ['/Users/aasthathorat/temporal-project/source1']
+    }
 
    
 
@@ -251,10 +273,14 @@ async def main():
             args=[source_folders, backup_folder, workflow_id],
             id=workflow_id,
             task_queue="file-backup-task-queue",
-            task_timeout=timedelta(seconds=30) 
+            task_timeout=timedelta(seconds=30)
         )
+        await handle.signal(FileBackupWorkflow.initial_signal, initial_signal_data)
         
         print(f"Workflow started with ID: {workflow_id}")
+
+
+        
 
         # Start the termination input thread
         termination_thread = threading.Thread(target=manage_workflow, args=(handle,workflow_id))
