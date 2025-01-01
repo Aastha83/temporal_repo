@@ -127,14 +127,7 @@ async def copy_files_activity(files_to_update: List[Tuple[str, str]], source_fol
             pass
             # print(e)
     return "Unpause",files_copied
-
-
-from temporalio import workflow
-from temporalio.common import RetryPolicy
-from typing import List, Dict
-from datetime import timedelta
-import asyncio
-
+       
 @workflow.defn
 class FileBackupWorkflow:
     def __init__(self):
