@@ -22,24 +22,22 @@ logger = logging.getLogger(__name__)
 
 
 
-def cancel_workflow(handle,workflow_id):
-    asyncio.run(handle.cancel())
-    # print(f"Cancellation requested for workflow with ID: {workflow_id}")
+# def cancel_workflow(handle,workflow_id):
+#     asyncio.run(handle.cancel())
+#     # print(f"Cancellation requested for workflow with ID: {workflow_id}")
        
-    
 
-
-def terminate_workflow(handle, workflow_id):
-    asyncio.run(handle.terminate(reason="User requested termination"))
-    # print("Workflow termination requested.")
 
 
 def manage_workflow(handle, workflow_id):
     while True:
-        action = input("Enter 'pause', 'resume', 'terminate', or 'q' to quit: ").lower()
+        action = input("Enter 'pause', 'resume', 'terminate', 'cancel' or 'q' to quit: ").lower()
         if action == 'pause':
             asyncio.run(handle.signal(FileBackupWorkflow.pause_backup))
-            # print(f"Pause signal sent to workflow {workflow_id}")
+
+        elif action == 'cancel':
+            asyncio.run(handle.cancel())
+            break
 
         elif action == 'resume':
             asyncio.run(handle.signal(FileBackupWorkflow.resume_backup))
@@ -47,29 +45,15 @@ def manage_workflow(handle, workflow_id):
 
         elif action == 'terminate':
             asyncio.run(handle.terminate(reason="User requested termination"))
+
             # print(f"Termination requested for workflow {workflow_id}")
-            # break
+            break
 
         elif action == 'q':
-            print("Exiting without terminating the workflow.")
+            # print("Exiting the workflow.")
             break
         else:
             print("Invalid input. Please try again.")
-    
-
-# def manage_workflow(handle,workflow_id):
-    
-#     while True:
-#         action = input("Enter 'terminate' to terminate \n'cancel' to cancel the worflow or 'q' to quit: ").strip().lower()
-#         if action == "terminate":
-#             terminate_workflow(handle, workflow_id)
-#         elif action == "cancel":
-#             cancel_workflow(handle, workflow_id)
-#         elif action == "q":
-#             break
-#         else:
-#             print("Invalid input. Please enter 'terminate' or 'q'.")
-
 
 
 @activity.defn
@@ -142,90 +126,118 @@ async def copy_files_activity(files_to_update: List[Tuple[str, str]], source_fol
         except Exception as e:
             pass
             # print(e)
-    
-    # return f"Copied {files_copied} files"
+    return "Unpause",files_copied
 
+
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+from typing import List, Dict
+from datetime import timedelta
+import asyncio
 
 @workflow.defn
 class FileBackupWorkflow:
     def __init__(self):
         self.paused = False
-        self.files_copied = 0
-        self.current_folder = None
+        self.files_copied = {}
+        self.folder_statuses = {}
     
     @workflow.query
     def is_paused(self) -> bool:
         return self.paused
 
     @workflow.run
-    async def run(self, source_folders: List[str], backup_folder: str, workflow_id : str):
-        print("Starting file backup workflow.")
-        for folder in source_folders:
-            self.current_folder = folder
-            await self.process_folder(folder, backup_folder, workflow_id)
-
-    async def process_folder(self, source_folder: str, backup_folder: str, workflow_id: str):
-        files_to_update = await workflow.execute_activity(
-            list_files_activity,
-            args=[source_folder, backup_folder],
-            start_to_close_timeout=timedelta(minutes=5),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-
+    async def run(self, source_folders: List[str], backup_folder: str, workflow_id: str):
+        # print("Starting file backup workflow.")
         
-        if len(files_to_update) > 0:
-            result, files_copied = await workflow.execute_activity(
-                copy_files_activity,
-                args=[files_to_update, source_folder, workflow_id],
-                start_to_close_timeout=timedelta(minutes=10),
-                heartbeat_timeout=timedelta(seconds=1),
+        # Run list_files_activity for all folders in parallel
+        list_tasks = [
+            workflow.execute_activity(
+                list_files_activity,
+                args=[folder, backup_folder],
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
-            self.files_copied = files_copied
-            if result == "PAUSE":
+            for folder in source_folders
+        ]
+        files_to_update_list = await asyncio.gather(*list_tasks)
+        
+        # Run process_folder for all folders in parallel
+        process_tasks = [
+            self.process_folder(folder, files_to_update, backup_folder, workflow_id)
+            for folder, files_to_update in zip(source_folders, files_to_update_list)
+        ]
+        await asyncio.gather(*process_tasks)
+        
+        for folder, status in self.folder_statuses.items():
+            if status['success']:
+                print(f"Successfully processed folder: {folder}")
+            else:
+                print(f"Failed to process folder: {folder}. Reason: {status['error']}")
+
+    async def process_folder(self, source_folder: str, files_to_update: List[str], backup_folder: str, workflow_id: str):
+        try:
+            self.files_copied[source_folder] = 0
+            if len(files_to_update) > 0:
+                copy_result = await workflow.execute_activity(
+                    copy_files_activity,
+                    args=[files_to_update, source_folder, workflow_id],
+                    start_to_close_timeout=timedelta(minutes=10),
+                    heartbeat_timeout=timedelta(seconds=1),
+                )
                 
-                # print(f"Pausing after copying {self.files_copied} files from {source_folder}")
-                self.paused = True
-                await workflow.wait_condition(lambda: not self.paused)
-                # await workflow.
-                # print("Workflow resumed.")
-                # raise Exception
+                if copy_result is None:
+                    raise ValueError(f"Copy files activity for {source_folder} returned None")
+                
+                result, files_copied = copy_result
+                self.files_copied[source_folder] = files_copied
+                
+                if result == "PAUSE":
+                    self.paused = True
+                    await workflow.wait_condition(lambda: not self.paused)
 
-        # Copy remaining files
-        if len(files_to_update) > self.files_copied:
-            result = await workflow.execute_activity(
-                copy_files_activity,
-                args=[files_to_update[self.files_copied:], source_folder, workflow_id],
-                start_to_close_timeout=timedelta(minutes=30),
-                heartbeat_timeout=timedelta(seconds=30),
-            )
-            self.files_copied = len(files_to_update)
+            # Copy remaining files
+            if len(files_to_update) > self.files_copied[source_folder]:
+                remaining_result = await workflow.execute_activity(
+                    copy_files_activity,
+                    args=[files_to_update[self.files_copied[source_folder]:], source_folder, workflow_id],
+                    start_to_close_timeout=timedelta(minutes=30),
+                    heartbeat_timeout=timedelta(seconds=30),
+                )
+                
+                if remaining_result is not None:
+                    _, additional_files_copied = remaining_result
+                    self.files_copied[source_folder] += additional_files_copied
 
-        print(f"Finished processing all {self.files_copied} files from {source_folder}")
-
-    
+            print(f"\nFinished processing all {self.files_copied[source_folder]} files from {source_folder}")
+            self.folder_statuses[source_folder] = {'success': True, 'error': None}
+        
+        except Exception as e:
+            self.folder_statuses[source_folder] = {'success': False, 'error': str(e)}
+            print(f"\nError processing folder {source_folder}: {str(e)}\n")
 
     @workflow.signal
     def pause_backup(self):
-        print("Received signal to pause backup")
+        print("\n\tReceived signal to pause backup\n")
         self.paused = True
 
     @workflow.signal
     def resume_backup(self):
-        print("Received signal to resume backup")
+        print("\n\tReceived signal to resume backup\n")
         self.paused = False
-
+    
 
 # main method
 async def main():
     client = await Client.connect("localhost:7233")
-    print("A connection to the Temporal server is established")
+    print("A connection to the Temporal server is established\n\n")
     
     source_folders = [
-        "/Users/aasthathorat/temporal-project/source1"
+        "/Users/aasthathorat/temporal-project/source1",
         # "/Users/aasthathorat/temporal-project/source4",
-        #  "/Users/aasthathorat/temporal-project/source2",
-        #  "/Users/aasthathorat/temporal-project/source3",
-        #  "/Users/aasthathorat/temporal-project/source6"
+        #  "/Users/aasthathorat/temporal-project/source2"
+         "/Users/aasthathorat/temporal-project/source3",
+         "/Users/aasthathorat/temporal-project/source6"
 
     ]
     backup_folder = "/Users/aasthathorat/temporal-project/backup2"
@@ -241,7 +253,6 @@ async def main():
 
     async with worker:
         workflow_id = f"file-backup-{uuid.uuid4()}"
-        # workflow_id = "file_backup_workflow-2"
         handle = await client.start_workflow(
             FileBackupWorkflow.run,
             args=[source_folders, backup_folder, workflow_id],
