@@ -157,40 +157,63 @@ async def get_user_input(task_name: str) -> str:
             return status
         # print("Invalid input. Please enter 'success' or 'failure'.")
 
+
+
 @workflow.defn
 class FileBackupWorkflow:
     def __init__(self):
-        self.files_copied = 0
-        self.current_folder = None
+        self.files_copied = {}
+        self.folders_to_process = []
     
     @workflow.run
     async def run(self, source_folders: List[str], backup_folder: str, workflow_id: str):
-        # print("Starting file backup workflow.")
-        for folder in source_folders:
-            self.current_folder = folder
-            await self.process_folder(folder, backup_folder, workflow_id)
+        print("Starting file backup workflow with parallel list and copy files.")
+        
+        # Execute list_files_activity for all folders in parallel
+        list_tasks = [
+            workflow.execute_activity(
+                list_files_activity,
+                args=[folder, backup_folder],
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            for folder in source_folders
+        ]
+        files_to_update_list = await asyncio.gather(*list_tasks)
+        
+        # Ask for user input for each folder's list files result
+        for folder, files_to_update in zip(source_folders, files_to_update_list):
+            status = await workflow.execute_activity(
+                get_user_input,
+                args=[f"List Files for folder {folder}"],
+                start_to_close_timeout=timedelta(minutes=5),
+            )
+            if status == "success":
+                self.folders_to_process.append((folder, files_to_update))
+            else:
+                print(f"List files task for {folder} marked as failure. Skipping folder.")
+        
+        # Process approved folders in parallel
+        copy_tasks = [
+            self.process_folder(folder, files_to_update, backup_folder, workflow_id)
+            for folder, files_to_update in self.folders_to_process
+        ]
+        await asyncio.gather(*copy_tasks)
 
-    async def process_folder(self, source_folder: str, backup_folder: str, workflow_id: str):
-        # List files task
-        files_to_update = await workflow.execute_activity(
-            list_files_activity,
-            args=[source_folder, backup_folder],
-            start_to_close_timeout=timedelta(minutes=5),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-
-        status = await workflow.execute_activity(
-            get_user_input,
-            args=["List Files"],
-            start_to_close_timeout=timedelta(minutes=5),
-        )
-
-        if status == "failure":
-            print(f"List files task for {source_folder} marked as failure. Skipping folder.")
-            return
-
+    async def process_folder(self, source_folder: str, files_to_update: List[str], backup_folder: str, workflow_id: str):
         if len(files_to_update) > 0:
-            # Copy files task
+            # Ask for user input before copying
+            status = await workflow.execute_activity(
+                get_user_input,
+                args=[f"Proceed with copying files for {source_folder}"],
+                start_to_close_timeout=timedelta(minutes=5),
+            )
+
+            if status == "failure":
+                print(f"Copy files task for {source_folder} marked as failure. Skipping folder.")
+                return
+
+            # Only copy files if user marked as success
             result, files_copied = await workflow.execute_activity(
                 copy_files_activity,
                 args=[files_to_update, source_folder, workflow_id],
@@ -198,20 +221,37 @@ class FileBackupWorkflow:
                 heartbeat_timeout=timedelta(seconds=1),
             )
 
-            status = await workflow.execute_activity(
-                get_user_input,
-                args=["Copy Files"],
-                start_to_close_timeout=timedelta(minutes=5),
-            )
+            self.files_copied[source_folder] = files_copied
+            if result == "PAUSE":
+                self.paused = True
+                await workflow.wait_condition(lambda: not self.paused)
 
-            if status == "failure":
-                print(f"Copy files task for {source_folder} marked as failure. Retrying...")
-                # Implement retry logic here if needed
-                return
+            # Copy remaining files if any
+            if len(files_to_update) > self.files_copied[source_folder]:
+                result = await workflow.execute_activity(
+                    copy_files_activity,
+                    args=[files_to_update[self.files_copied[source_folder]:], source_folder, workflow_id],
+                    start_to_close_timeout=timedelta(minutes=30),
+                    heartbeat_timeout=timedelta(seconds=30),
+                )
+                self.files_copied[source_folder] = len(files_to_update)
 
-            self.files_copied = files_copied
+            print(f"Finished processing all {self.files_copied[source_folder]} files from {source_folder}")
+        else:
+            print(f"No files to update in {source_folder}")
 
-        print(f"Finished processing all {self.files_copied} files from {source_folder}")
+    
+    @workflow.signal
+    def pause_backup(self):
+        print("Received signal to pause backup")
+        self.paused = True
+
+    @workflow.signal
+    def resume_backup(self):
+        print("Received signal to resume backup")
+        self.paused = False
+
+
 
 
 # main method
